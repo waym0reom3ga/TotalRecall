@@ -6,13 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "totalrecall"
 version = "0.1.0"
 description = "Recursive memory compression system with LLM distillation"
-requires-python = ">=3.11, <3.14"
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "openai==2.24.0",
 ]
 
 [project.scripts]
 totalrecall = "totalrecall.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["totalrecall*"]
 
 [tool.uv]
 package = true
