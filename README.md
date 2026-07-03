@@ -1,5 +1,7 @@
 # TotalRecall
 
+![TotalRecall Banner](TotalRecall_banner.png)
+
 Recursive memory compression system with LLM-powered distillation.
 
 ## Overview
