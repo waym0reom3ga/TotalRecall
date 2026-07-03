@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--model", default=None, help="LLM model name")
     parser.add_argument("--base-url", default=None, help="OpenAI-compatible API base URL")
     parser.add_argument("--api-key", default=None, help="API key (falls back to OPENAI_API_KEY)")
+    parser.add_argument("--cjk-opt", default="YES", help="CJK encoding for memories (default=YES; any other value disables)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -57,6 +58,7 @@ def main():
         model=args.model,
         base_url=args.base_url,
         api_key=args.api_key,
+        cjk_opt=args.cjk_opt,
     )
 
     try:

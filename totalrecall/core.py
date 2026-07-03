@@ -9,7 +9,7 @@ from typing import Any
 from openai import OpenAI
 
 from .schema import init_memory_log, init_total_recall
-from .templates import L0_TO_L1_TEMPLATE, L1_TO_L2_TEMPLATE
+from .templates import L0_TO_L1_TEMPLATE, L1_TO_L2_TEMPLATE, CJK_INSTRUCTION
 from .validate import enforce_json
 
 logger = logging.getLogger(__name__)
@@ -19,9 +19,11 @@ class TotalRecall:
     """Memory compression system with recursive distillation."""
 
     def __init__(self, db_dir: str = "~/.totalrecall", model: str | None = None,
-                 base_url: str | None = None, api_key: str | None = None):
+                 base_url: str | None = None, api_key: str | None = None,
+                 cjk_opt: str = "YES"):
         self.db_dir = Path(db_dir).expanduser()
         self.model = model or "gpt-4o-mini"
+        self.cjk_enabled = cjk_opt == "YES"
 
         client_kwargs: dict[str, Any] = {}
         if base_url:
@@ -100,7 +102,8 @@ class TotalRecall:
             parts.append(part)
 
         commands_text = "\n\n---\n\n".join(parts)
-        prompt = L0_TO_L1_TEMPLATE.format(commands_text=commands_text)
+        cjk_instr = CJK_INSTRUCTION if self.cjk_enabled else ""
+        prompt = L0_TO_L1_TEMPLATE.format(commands_text=commands_text, cjk_instruction=cjk_instr)
 
         result = self._llm_call(prompt)
         return self._store_memories(result, level=1, source_ids=[r["id"] for r in rows])
@@ -136,7 +139,8 @@ class TotalRecall:
             parts.append(f"[Memory {r['id']} (L{r['level']})] Tags: [{tags_str}]\n{r['information']}")
 
         memories_text = "\n\n---\n\n".join(parts)
-        prompt = L1_TO_L2_TEMPLATE.format(source_level=source_level, memories_text=memories_text)
+        cjk_instr = CJK_INSTRUCTION if self.cjk_enabled else ""
+        prompt = L1_TO_L2_TEMPLATE.format(source_level=source_level, memories_text=memories_text, cjk_instruction=cjk_instr)
 
         result = self._llm_call(prompt)
         return self._store_memories(result, level=out_level, source_ids=[r["id"] for r in rows])
