@@ -2,13 +2,12 @@
 
 import json
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
 
-from .schema import init_memory_log, init_total_recall
+from .schema import init_db
 from .templates import L0_TO_L1_TEMPLATE, L1_TO_L2_TEMPLATE, CJK_INSTRUCTION
 from .validate import enforce_json
 
@@ -41,43 +40,44 @@ class TotalRecall:
         self._client: OpenAI | None = None
         if client_kwargs.get("api_key"):
             self._client = OpenAI(**client_kwargs)
-        self.log_conn = init_memory_log(self.db_dir)
-        self.recall_conn = init_total_recall(self.db_dir)
+
+        # Single database connection for everything
+        self.conn = init_db(self.db_dir)
         logger.info("TotalRecall initialized at %s", self.db_dir)
 
     # ── Ingestion ────────────────────────────────────────────────
 
     def ingest(self, session_id: str, input_text: str, output_text: str,
                error_log: str = "") -> int:
-        """Append a command to memory_log.db. Returns command id."""
-        cur = self.log_conn.execute(
+        """Append a command to the database. Returns command id."""
+        cur = self.conn.execute(
             "INSERT INTO commands (session_id, chunk_number, layer, input, output, error_log) "
             "VALUES (?, -1, 0, ?, ?, ?)",
             (session_id, input_text, output_text, error_log),
         )
-        self.log_conn.commit()
-        return cur.lastrowid
+        self.conn.commit()
+        return cur.lastrowid if cur.lastrowid is not None else 0
 
     # ── Chunking ─────────────────────────────────────────────────
 
     def assign_chunk(self) -> int | None:
         """Assign unassigned commands to next chunk number. Returns chunk_number or None."""
-        rows = self.log_conn.execute(
+        rows = self.conn.execute(
             "SELECT id FROM commands WHERE chunk_number = -1 ORDER BY id"
         ).fetchall()
         if not rows:
             return None
 
         ids = [r["id"] for r in rows]
-        cur = self.log_conn.execute("SELECT COALESCE(MAX(chunk_number), 0) + 1 FROM chunks")
+        cur = self.conn.execute("SELECT COALESCE(MAX(chunk_number), 0) + 1 FROM chunks")
         chunk_num = cur.fetchone()[0]
 
-        self.log_conn.executemany(
+        self.conn.executemany(
             "UPDATE commands SET chunk_number = ? WHERE id = ?",
             [(chunk_num, iid) for iid in ids],
         )
-        self.log_conn.execute("INSERT INTO chunks (chunk_number) VALUES (?)", (chunk_num,))
-        self.log_conn.commit()
+        self.conn.execute("INSERT INTO chunks (chunk_number) VALUES (?)", (chunk_num,))
+        self.conn.commit()
         logger.info("Assigned %d commands to chunk %d", len(ids), chunk_num)
         return chunk_num
 
@@ -85,7 +85,7 @@ class TotalRecall:
 
     def compress_chunk(self, chunk_number: int) -> list[int]:
         """Compress a single L0 chunk into L1 memories. Returns list of new memory ids."""
-        rows = self.log_conn.execute(
+        rows = self.conn.execute(
             "SELECT id, input, output, error_log FROM commands WHERE chunk_number = ? ORDER BY id",
             (chunk_number,),
         ).fetchall()
@@ -115,7 +115,7 @@ class TotalRecall:
         if not memory_ids:
             return []
 
-        rows = self.recall_conn.execute(
+        rows = self.conn.execute(
             "SELECT id, level, tags, information FROM memories WHERE id IN (" +
             ",".join("?" * len(memory_ids)) + ")",
             memory_ids,
@@ -156,7 +156,7 @@ class TotalRecall:
         conditions = " OR ".join(f"tags LIKE ?" for _ in tags)
         params = [f"%{t}%" for t in tags]
 
-        rows = self.recall_conn.execute(
+        rows = self.conn.execute(
             f"SELECT id, level, information FROM memories WHERE ({conditions}) "
             "ORDER BY level DESC, created_at DESC",
             params,
@@ -179,14 +179,14 @@ class TotalRecall:
 
     def status(self) -> dict:
         """Return stats: command count, chunk count, memory counts by level."""
-        cmd_count = self.log_conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
-        unassigned = self.log_conn.execute(
+        cmd_count = self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
+        unassigned = self.conn.execute(
             "SELECT COUNT(*) FROM commands WHERE chunk_number = -1"
         ).fetchone()[0]
 
-        chunks = self.log_conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        chunks = self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
 
-        level_rows = self.recall_conn.execute(
+        level_rows = self.conn.execute(
             "SELECT level, COUNT(*) as cnt FROM memories GROUP BY level ORDER BY level"
         ).fetchall()
         by_level = {str(r["level"]): r["cnt"] for r in level_rows}
@@ -229,7 +229,7 @@ class TotalRecall:
 
     def _store_memories(self, result: dict | None, level: int,
                         source_ids: list[int]) -> list[int]:
-        """Store validated memories into total_recall.db. Returns new memory ids."""
+        """Store validated memories into the database. Returns new memory ids."""
         if not result or "memories" not in result:
             return []
 
@@ -239,17 +239,16 @@ class TotalRecall:
             info = mem.get("information", "")
             src_json = json.dumps(source_ids)
 
-            cur = self.recall_conn.execute(
+            cur = self.conn.execute(
                 "INSERT INTO memories (level, tags, information, source_chunk_ids) VALUES (?, ?, ?, ?)",
                 (level, tags_json, info, src_json),
             )
             stored.append(cur.lastrowid)
 
-        self.recall_conn.commit()
+        self.conn.commit()
         logger.info("Stored %d memories at level %d", len(stored), level)
         return stored
 
     def close(self):
-        """Close database connections."""
-        self.log_conn.close()
-        self.recall_conn.close()
+        """Close database connection."""
+        self.conn.close()
