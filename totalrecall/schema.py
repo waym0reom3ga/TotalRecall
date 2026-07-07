@@ -39,7 +39,7 @@ def init_db(db_dir: Path) -> sqlite3.Connection:
     """Initialize a single SQLite database with WAL mode and return the connection."""
     db_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_dir / "totalrecall.db"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
