@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 
@@ -19,7 +19,7 @@ class TotalRecall:
 
     def __init__(self, db_dir: str = "~/.totalrecall", model: str | None = None,
                  base_url: str | None = None, api_key: str | None = None,
-                 cjk_opt: str = "YES"):
+                 cjk_opt: str = "YES", llm_backend: Callable | None = None):
         self.db_dir = Path(db_dir).expanduser()
         self.model = model or "gpt-4o-mini"
         self.cjk_enabled = cjk_opt == "YES"
@@ -40,6 +40,9 @@ class TotalRecall:
         self._client: OpenAI | None = None
         if client_kwargs.get("api_key"):
             self._client = OpenAI(**client_kwargs)
+
+        # External LLM backend (callable) — takes priority over OpenAI client
+        self._llm_backend = llm_backend
 
         # Single database connection for everything
         self.conn = init_db(self.db_dir)
@@ -203,24 +206,36 @@ class TotalRecall:
 
     def _llm_call(self, prompt: str) -> dict | None:
         """Call the LLM and enforce valid JSON output."""
-        # Lazy-init client if not yet created
-        if self._client is None:
+        messages = [{"role": "user", "content": prompt}]
+
+        # 1. Try external backend first (e.g., Lycus auxiliary_client)
+        if callable(self._llm_backend):
             try:
-                self._client = OpenAI(**self._client_kwargs)
+                resp = self._llm_backend(messages, temperature=0.1)
+                text = resp.choices[0].message.content or ""
             except Exception as e:
-                logger.error("Cannot create OpenAI client: %s", e)
+                logger.error("External LLM backend failed: %s", e)
                 return None
 
-        try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-            )
-            text = resp.choices[0].message.content or ""
-        except Exception as e:
-            logger.error("LLM call failed: %s", e)
-            return None
+        # 2. Fall back to built-in OpenAI client
+        else:
+            if self._client is None:
+                try:
+                    self._client = OpenAI(**self._client_kwargs)
+                except Exception as e:
+                    logger.error("Cannot create OpenAI client: %s", e)
+                    return None
+
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                )
+                text = resp.choices[0].message.content or ""
+            except Exception as e:
+                logger.error("LLM call failed: %s", e)
+                return None
 
         result = enforce_json(text)
         if result is None:
