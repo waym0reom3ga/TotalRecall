@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,6 +14,15 @@ from .templates import L0_TO_L1_TEMPLATE, L1_TO_L2_TEMPLATE, CJK_INSTRUCTION
 from .validate import enforce_json
 
 logger = logging.getLogger(__name__)
+
+
+class CompressionError(Exception):
+    """Raised when the LLM backend fails during compression.
+
+    Distinguishes "LLM is broken" from "LLM returned nothing useful".
+    Callers should catch this to avoid silently dropping turns.
+    """
+    pass
 
 
 class TotalRecall:
@@ -43,6 +53,10 @@ class TotalRecall:
 
         # External LLM backend (callable) — takes priority over OpenAI client
         self._llm_backend = llm_backend
+
+        # Failure tracking — surfaced via status() for visibility
+        self._llm_failure_count = 0
+        self._last_llm_error: str = ""
 
         # Single database connection for everything
         self.conn = init_db(self.db_dir)
@@ -218,7 +232,8 @@ class TotalRecall:
     # ── Status ───────────────────────────────────────────────────
 
     def status(self) -> dict:
-        """Return stats: command count, chunk count, memory counts by level."""
+        """Return stats: command count, chunk count, memory counts by level,
+        and LLM backend health indicators."""
         cmd_count = self.conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0]
         unassigned = self.conn.execute(
             "SELECT COUNT(*) FROM commands WHERE chunk_number = -1"
@@ -237,56 +252,92 @@ class TotalRecall:
             "chunks": chunks,
             "memories_by_level": by_level,
             "total_memories": sum(by_level.values()),
+            "llm_failure_count": self._llm_failure_count,
+            "last_llm_error": self._last_llm_error,
         }
 
     # ── Internal helpers ─────────────────────────────────────────
 
-    def _llm_call(self, prompt: str) -> dict | None:
-        """Call the LLM and enforce valid JSON output."""
+    def _llm_call(self, prompt: str, max_retries: int = 3) -> dict | None:
+        """Call the LLM and enforce valid JSON output.
+
+        Retries up to max_retries times with exponential backoff on failure.
+        Tracks failure count for visibility via status().
+        """
         messages = [{"role": "user", "content": prompt}]
 
-        # 1. Try external backend first (e.g., Lycus auxiliary_client)
-        if callable(self._llm_backend):
+        for attempt in range(1, max_retries + 1):
+            text = ""
             try:
-                resp = self._llm_backend(messages, temperature=0.1)
-                text = resp.choices[0].message.content or ""
+                # 1. Try external backend first (e.g., Lycus auxiliary_client)
+                if callable(self._llm_backend):
+                    resp = self._llm_backend(messages, temperature=0.1)
+                    text = resp.choices[0].message.content or ""
+                # 2. Fall back to built-in OpenAI client
+                else:
+                    if self._client is None:
+                        self._client = OpenAI(**self._client_kwargs)
+                    resp = self._client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=0.1,
+                    )
+                    text = resp.choices[0].message.content or ""
             except Exception as e:
-                logger.error("External LLM backend failed: %s", e)
-                return None
-
-        # 2. Fall back to built-in OpenAI client
-        else:
-            if self._client is None:
-                try:
-                    self._client = OpenAI(**self._client_kwargs)
-                except Exception as e:
-                    logger.error("Cannot create OpenAI client: %s", e)
-                    return None
-
-            try:
-                resp = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.1,
+                self._llm_failure_count += 1
+                self._last_llm_error = str(e)
+                logger.error(
+                    "LLM call failed (attempt %d/%d): %s",
+                    attempt, max_retries, e,
                 )
-                text = resp.choices[0].message.content or ""
-            except Exception as e:
-                logger.error("LLM call failed: %s", e)
-                return None
+                if attempt < max_retries:
+                    time.sleep(min(2 ** (attempt - 1), 10))  # exponential backoff
+                    continue
 
-        result = enforce_json(text)
-        if result is None:
-            logger.error("Failed to get valid compression output")
-        return result
+            # Validate JSON output
+            result = enforce_json(text)
+            if result is not None:
+                # Success — reset failure counter
+                self._llm_failure_count = max(0, self._llm_failure_count - 1)
+                return result
+
+            # JSON validation failed — treat as retryable
+            self._llm_failure_count += 1
+            self._last_llm_error = "JSON validation failed"
+            logger.warning(
+                "LLM returned invalid JSON (attempt %d/%d)",
+                attempt, max_retries,
+            )
+            if attempt < max_retries:
+                time.sleep(min(2 ** (attempt - 1), 10))
+
+        # All retries exhausted
+        logger.error(
+            "LLM call exhausted all %d retries. Last error: %s",
+            max_retries, self._last_llm_error,
+        )
+        return None
 
     def _store_memories(self, result: dict | None, level: int,
                         source_ids: list[int]) -> list[int]:
-        """Store validated memories into the database. Returns new memory ids."""
-        if not result or "memories" not in result:
+        """Store validated memories into the database. Returns new memory ids.
+
+        Raises CompressionError if the LLM backend failed entirely,
+        so callers can distinguish "LLM broken" from "LLM returned nothing useful".
+        """
+        if result is None:
+            raise CompressionError(
+                f"LLM backend failed for level {level} compression. "
+                f"Failure count: {self._llm_failure_count}, last error: {self._last_llm_error}"
+            )
+
+        memories = result.get("memories", [])
+        if not memories:
+            logger.info("LLM returned 0 memories for level %d (not an error — nothing to extract)", level)
             return []
 
         stored = []
-        for mem in result["memories"]:
+        for mem in memories:
             tags_json = json.dumps(mem.get("tags", []))
             info = mem.get("information", "")
             src_json = json.dumps(source_ids)
