@@ -32,6 +32,30 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags);
 CREATE INDEX IF NOT EXISTS idx_memories_level_created ON memories(level DESC, created_at DESC);
+
+-- FTS5 index on information for semantic content search (fallback when tag matching fails)
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    information,
+    content='memories',
+    content_rowid='rowid'
+);
+
+-- Triggers to keep FTS in sync
+CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories
+BEGIN
+    INSERT INTO memories_fts(rowid, information) VALUES (new.id, new.information);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE OF information ON memories
+BEGIN
+    DELETE FROM memories_fts WHERE rowid = old.id;
+    INSERT INTO memories_fts(rowid, information) VALUES (new.id, new.information);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories
+BEGIN
+    DELETE FROM memories_fts WHERE rowid = old.id;
+END;
 """
 
 

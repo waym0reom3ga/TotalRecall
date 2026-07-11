@@ -150,12 +150,26 @@ class TotalRecall:
 
     # ── Recall ───────────────────────────────────────────────────
 
-    def recall(self, tags: list[str], max_tokens: int = 200_000) -> str:
-        """Recall memories matching tags within token budget."""
+    def recall(self, tags: list[str], max_tokens: int = 200_000,
+               query_text: str = "") -> str:
+        """Recall memories matching tags within token budget.
+
+        Uses a two-phase approach:
+        1. Tag-based matching (LIKE on tags column)
+        2. FTS5 content search fallback (when tag matching returns nothing)
+
+        Args:
+            tags: List of tags to match against stored memory tags.
+            max_tokens: Token budget for results.
+            query_text: Original query text (used for FTS5 fallback search).
+        """
         if not tags:
             return ""
 
-        # Build OR query for JSON array containment
+        budget_chars = max_tokens * 4  # rough: 4 chars per token
+        rows = []
+
+        # Phase 1: Tag-based matching
         conditions = " OR ".join(f"tags LIKE ?" for _ in tags)
         params = [f"%{t}%" for t in tags]
 
@@ -165,7 +179,30 @@ class TotalRecall:
             params,
         ).fetchall()
 
-        budget_chars = max_tokens * 4  # rough: 4 chars per token
+        # Phase 2: FTS5 content search fallback
+        # When tag matching fails (e.g., language mismatch: Chinese tags vs English query),
+        # search the actual memory content using the original query text.
+        if not rows and query_text:
+            try:
+                fts_query = " OR ".join(f'"{t}"' for t in tags if len(t) >= 3)
+                if fts_query:
+                    rows = self.conn.execute(
+                        f"""
+                        SELECT m.id, m.level, m.information
+                        FROM memories m
+                        WHERE m.rowid IN (
+                            SELECT rowid FROM memories_fts
+                            WHERE memories_fts MATCH ?
+                        )
+                        ORDER BY m.level DESC, m.created_at DESC
+                        """,
+                        (fts_query,),
+                    ).fetchall()
+                    if rows:
+                        logger.info("FTS5 fallback recall matched %d memories", len(rows))
+            except Exception as e:
+                logger.debug("FTS5 fallback search failed: %s", e)
+
         accumulated = []
         total_chars = 0
 
