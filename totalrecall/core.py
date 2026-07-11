@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,7 +22,7 @@ class TotalRecall:
                  base_url: str | None = None, api_key: str | None = None,
                  cjk_opt: str = "YES", llm_backend: Callable | None = None):
         self.db_dir = Path(db_dir).expanduser()
-        self.model = model or "gpt-4o-mini"
+        self.model = model or os.environ.get("LYCUS_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
         self.cjk_enabled = cjk_opt == "YES"
 
         client_kwargs: dict[str, Any] = {}
@@ -30,7 +31,6 @@ class TotalRecall:
         if api_key:
             client_kwargs["api_key"] = api_key
         else:
-            import os
             key = os.environ.get("OPENAI_API_KEY")
             if key:
                 client_kwargs["api_key"] = key
