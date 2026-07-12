@@ -168,22 +168,27 @@ class TotalRecall:
                query_text: str = "") -> str:
         """Recall memories matching tags within token budget.
 
-        Uses a two-phase approach:
-        1. Tag-based matching (LIKE on tags column)
-        2. FTS5 content search fallback (when tag matching returns nothing)
+        Three-phase approach:
+        1. Direct tag match (LIKE on tags column) — fast, no LLM needed
+        2. CJK count-sort: translate query to Chinese tags, score memories by
+           how many stored tags match, return highest-scoring results
+        3. FTS5 content search fallback (when nothing matches at all)
+
+        When CJK is enabled, stored tags and information are in Chinese.
+        The translation step bridges English queries to Chinese memory content.
 
         Args:
             tags: List of tags to match against stored memory tags.
             max_tokens: Token budget for results.
-            query_text: Original query text (used for FTS5 fallback search).
+            query_text: Original query text (used for CJK translation + FTS5).
         """
         if not tags:
             return ""
 
         budget_chars = max_tokens * 4  # rough: 4 chars per token
-        rows = []
+        scored: list[tuple[int, int, str]] = []  # (score, id, info)
 
-        # Phase 1: Tag-based matching
+        # Phase 1: Direct tag match
         conditions = " OR ".join(f"tags LIKE ?" for _ in tags)
         params = [f"%{t}%" for t in tags]
 
@@ -193,12 +198,29 @@ class TotalRecall:
             params,
         ).fetchall()
 
-        # Phase 2: FTS5 content search fallback
-        # When tag matching fails (e.g., language mismatch: Chinese tags vs English query),
-        # search the actual memory content using the original query text.
-        if not rows and query_text:
+        if rows:
+            for r in rows:
+                scored.append((1, r["id"], f"[L{r['level']}] {r['information']}"))
+
+        # Phase 2: CJK count-sort
+        cjk_tags: list[str] = []
+        if self.cjk_enabled and query_text:
+            cjk_tags = self._translate_query_to_tags(query_text)
+            if cjk_tags:
+                cjk_scored = self._count_sort_recall(cjk_tags)
+                seen_ids = {s[1] for s in scored}
+                for s in cjk_scored:
+                    if s[1] not in seen_ids:
+                        scored.append(s)
+                        seen_ids.add(s[1])
+
+        # Phase 3: FTS5 content search fallback
+        if not scored and query_text:
             try:
-                fts_query = " OR ".join(f'"{t}"' for t in tags if len(t) >= 3)
+                # Use translated Chinese tags for FTS5 when CJK is enabled
+                # (stored information is in Chinese, English terms won't match)
+                search_tags = cjk_tags if self.cjk_enabled and cjk_tags else tags
+                fts_query = " OR ".join(f'"{t}"' for t in search_tags if len(t) >= 2)
                 if fts_query:
                     rows = self.conn.execute(
                         f"""
@@ -212,22 +234,97 @@ class TotalRecall:
                         """,
                         (fts_query,),
                     ).fetchall()
-                    if rows:
-                        logger.info("FTS5 fallback recall matched %d memories", len(rows))
+                    for r in rows:
+                        scored.append((0, r["id"], f"[L{r['level']}] {r['information']}"))
             except Exception as e:
                 logger.debug("FTS5 fallback search failed: %s", e)
 
+        # Sort by score descending, then by id (newer first)
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+
+        # Accumulate within budget
         accumulated = []
         total_chars = 0
-
-        for r in rows:
-            info = r["information"]
+        for _, _, info in scored:
             if total_chars + len(info) > budget_chars and accumulated:
                 break
-            accumulated.append(f"[L{r['level']}] {info}")
+            accumulated.append(info)
             total_chars += len(info)
 
         return "\n\n".join(accumulated)
+
+    def _translate_query_to_tags(self, query_text: str) -> list[str]:
+        """Use LLM to translate an English query into Chinese subject tags.
+
+        Returns list of Chinese tag strings, or empty list on failure.
+        Uses max_retries=1 to fail fast — this is a lookup, not a write path.
+        """
+        prompt = (
+            "Given this query, produce as many Chinese (中文) subject tags as appropriate "
+            "to cover the subjects. Output ONLY a JSON array of strings.\n\n"
+            f"Query: {query_text}\n\n"
+            "Chinese tags:"
+        )
+        result = self._llm_call(prompt, max_retries=1)
+        if not result:
+            return []
+
+        # Handle both our standard format and bare JSON arrays
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            # Try subjects key first, then memories tags
+            subjects = result.get("subjects", [])
+            if subjects:
+                return subjects
+            for mem in result.get("memories", []):
+                return mem.get("tags", [])
+        return []
+
+    def _count_sort_recall(self, query_tags: list[str]) -> list[tuple[int, int, str]]:
+        """Score all memories by how many of their stored tags match query tags.
+
+        Returns list of (score, memory_id, formatted_info) sorted by score desc.
+        Only returns memories with score > 0.
+        """
+        if not query_tags:
+            return []
+
+        # Fetch all memories (we'll score them in Python)
+        rows = self.conn.execute(
+            "SELECT id, level, tags, information FROM memories "
+            "ORDER BY level DESC, created_at DESC"
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        scored: list[tuple[int, int, str]] = []
+        for r in rows:
+            try:
+                stored_tags = json.loads(r["tags"]) if r["tags"] else []
+            except (json.JSONDecodeError, TypeError):
+                stored_tags = []
+
+            # Count matches: case-insensitive substring match
+            match_count = 0
+            for qt in query_tags:
+                qt_lower = qt.lower()
+                for st in stored_tags:
+                    if qt_lower in st.lower() or st.lower() in qt_lower:
+                        match_count += 1
+                        break  # one match per query tag is enough
+
+            if match_count > 0:
+                scored.append((
+                    match_count,
+                    r["id"],
+                    f"[L{r['level']}] {r['information']}",
+                ))
+
+        # Sort by score descending
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        return scored
 
     # ── Status ───────────────────────────────────────────────────
 
